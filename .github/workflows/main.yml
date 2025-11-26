@@ -1,40 +1,39 @@
-name: Build PHP Application
+name: Simple Database Dump
 
 on:
   push:
-    branches: [ main, master ]
-  release:
-    types: [ created ]
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout code
+    - name: Checkout
       uses: actions/checkout@v4
       
-    - name: Setup PHP
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.0'
-        extensions: mbstring, ctype, filter, hash, iconv
-        
-    - name: Install dependencies
-      run: composer install --no-dev --prefer-dist --optimize-autoloader --no-progress
+    - name: Setup MySQL Client
+      run: sudo apt-get install -y mysql-client
       
-    - name: Create deployment package
+    - name: Dump Entire Database
       run: |
-        # Remove development files
-        rm -f composer.lock
-        rm -rf tests/ 2>/dev/null || true
+        mysqldump \
+          -h "$DB_HOST" \
+          -u "$DB_USER" \
+          -p"$DB_PASS" \
+          --single-transaction \
+          --routines \
+          --triggers \
+          "$DB_NAME" > database_backup.sql
         
-        # Create ZIP (excluding .git and other unnecessary files)
-        zip -r deployment-package.zip . -x "*.git*" "*.github*" "README.md" "*.txt" "*.md" "composer.json"
+        echo "Dump completed: $(ls -lh database_backup.sql)"
+      env:
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_PASS: ${{ secrets.DB_PASS }}
+        DB_NAME: ${{ secrets.DB_NAME }}
         
-    - name: Upload artifact
+    - name: Upload Dump
       uses: actions/upload-artifact@v4
       with:
-        name: php-app
-        path: deployment-package.zip
-        retention-days: 30
+        name: database-backup
+        path: database_backup.sql
