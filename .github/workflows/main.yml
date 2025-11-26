@@ -8,6 +8,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: blog_db
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -16,51 +26,178 @@ jobs:
       uses: shivammathur/setup-php@v2
       with:
         php-version: '8.0'
-        extensions: mbstring, ctype, filter, hash, iconv, pdo, pdo_mysql
+        extensions: mbstring, ctype, filter, hash, iconv, pdo, pdo_mysql, gd
       
     - name: Install dependencies
       run: composer install --no-dev --prefer-dist --optimize-autoloader --no-progress
       
-    - name: Create database dump
+    - name: Install MySQL Client
+      run: sudo apt-get update && sudo apt-get install -y mysql-client
+      
+    - name: Wait for MySQL to be ready
       run: |
-        mysqldump -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASS }} ${{ secrets.DB_NAME }} > database.sql 2>/dev/null || echo "Database dump failed, creating template"
+        while ! mysqladmin ping -h"127.0.0.1" -uroot -proot --silent; do
+          sleep 1
+        done
+        echo "MySQL is ready!"
+      
+    - name: Try to connect to production database (optional)
+      run: |
+        echo "🔧 Attempting to connect to production database..."
+        # Ini akan skip jika tidak bisa connect, tidak error
+        mysqldump \
+          -h "${{ secrets.DB_HOST }}" \
+          -u "${{ secrets.DB_USER }}" \
+          -p"${{ secrets.DB_PASS }}" \
+          "${{ secrets.DB_NAME }}" > production_dump.sql 2>/dev/null || {
+          echo "⚠️  Could not connect to production database, using local structure"
+        }
         
-        if [ ! -s "database.sql" ]; then
-          cat > database.sql << 'EOF'
--- Blog Database Template
+        if [ -f "production_dump.sql" ] && [ -s "production_dump.sql" ]; then
+          echo "✅ Production database dump successful"
+          mv production_dump.sql database.sql
+        else
+          echo "📝 Generating database structure from local analysis"
+          generate_local_structure
+        }
+      
+    - name: Generate local database structure
+      run: |
+        echo "📝 Creating local database structure..."
+        
+        # Buat database structure untuk blog
+        mysql -h 127.0.0.1 -u root -proot blog_db << 'EOF'
+-- Users table
 CREATE TABLE IF NOT EXISTS users (
     id INT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(50) UNIQUE NOT NULL,
     email VARCHAR(100) UNIQUE NOT NULL,
     password VARCHAR(255) NOT NULL,
-    role ENUM('admin','author') DEFAULT 'author',
+    display_name VARCHAR(100),
+    role ENUM('admin', 'author', 'subscriber') DEFAULT 'subscriber',
+    avatar VARCHAR(255),
+    bio TEXT,
+    status ENUM('active', 'inactive') DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Categories table
+CREATE TABLE IF NOT EXISTS categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    parent_id INT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Posts table
 CREATE TABLE IF NOT EXISTS posts (
     id INT AUTO_INCREMENT PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
-    content TEXT NOT NULL,
+    slug VARCHAR(255) UNIQUE NOT NULL,
+    content LONGTEXT NOT NULL,
+    excerpt TEXT,
+    featured_image VARCHAR(255),
     author_id INT NOT NULL,
-    status ENUM('published','draft') DEFAULT 'draft',
+    category_id INT,
+    status ENUM('published', 'draft', 'pending') DEFAULT 'draft',
+    comment_status ENUM('open', 'closed') DEFAULT 'open',
+    view_count INT DEFAULT 0,
+    published_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+);
+
+-- Comments table
+CREATE TABLE IF NOT EXISTS comments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    post_id INT NOT NULL,
+    author_name VARCHAR(100) NOT NULL,
+    author_email VARCHAR(100) NOT NULL,
+    content TEXT NOT NULL,
+    status ENUM('approved', 'pending', 'spam') DEFAULT 'pending',
+    parent_id INT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
+);
+
+-- Settings table
+CREATE TABLE IF NOT EXISTS settings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    setting_key VARCHAR(100) UNIQUE NOT NULL,
+    setting_value TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Insert sample data
+INSERT IGNORE INTO users (username, email, password, display_name, role) VALUES 
+('admin', 'admin@blogme.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Administrator', 'admin');
+
+INSERT IGNORE INTO categories (name, slug) VALUES 
+('Uncategorized', 'uncategorized'),
+('Technology', 'technology'),
+('Lifestyle', 'lifestyle');
+
+INSERT IGNORE INTO settings (setting_key, setting_value) VALUES 
+('site_name', 'BlogMe'),
+('site_description', 'A modern blog platform'),
+('posts_per_page', '12');
 EOF
-        fi
-      env:
-        DB_HOST: ${{ secrets.DB_HOST }}
-        DB_USER: ${{ secrets.DB_USER }}
-        DB_PASS: ${{ secrets.DB_PASS }}
-        DB_NAME: ${{ secrets.DB_NAME }}
-        
-    - name: Create package
+
+        # Dump the structure we just created
+        mysqldump -h 127.0.0.1 -u root -proot blog_db > database.sql
+        echo "✅ Local database structure created: $(ls -lh database.sql)"
+      
+    - name: Create .env template
       run: |
-        zip -r blog-package.zip . -x "*.git*" "*.github*" "README.md" "composer.lock"
-        
-    - name: Upload package
+        cat > .env << 'EOF'
+# Database Configuration
+DB_HOST=localhost
+DB_NAME=blog_db
+DB_USER=root
+DB_PASS=root
+
+# Site Configuration
+SITE_URL=http://localhost:8000
+SITE_NAME=BlogMe
+
+# Upload Settings
+UPLOAD_PATH=./assets/images/uploads/
+EOF
+      
+    - name: Create uploads directory structure
+      run: |
+        mkdir -p assets/images/uploads
+        mkdir -p assets/images/avatars
+        touch assets/images/uploads/.gitkeep
+        touch assets/images/avatars/.gitkeep
+      
+    - name: Create deployment package
+      run: |
+        zip -r deployment-package.zip . \
+          -x "*.git*" \
+          "*.github*" \
+          "README.md" \
+          "composer.lock" \
+          "tests/*" \
+          "*.log"
+          
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: blog-package
+        name: blog-deployment
         path: |
-          blog-package.zip
+          deployment-package.zip
           database.sql
+        retention-days: 30
+        
+    - name: Show package info
+      run: |
+        echo "=== PACKAGE INFO ==="
+        echo "Deployment Package: $(ls -lh deployment-package.zip)"
+        echo "Database SQL: $(ls -lh database.sql)"
+        echo "===================="
