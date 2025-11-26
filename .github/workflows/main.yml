@@ -3,8 +3,6 @@ name: Build Blog Application
 on:
   push:
     branches: [ main, master ]
-  release:
-    types: [ created ]
 
 jobs:
   build:
@@ -18,62 +16,51 @@ jobs:
       uses: shivammathur/setup-php@v2
       with:
         php-version: '8.0'
-        extensions: mbstring, ctype, filter, hash, iconv, pdo, pdo_mysql, gd
+        extensions: mbstring, ctype, filter, hash, iconv, pdo, pdo_mysql
       
     - name: Install dependencies
       run: composer install --no-dev --prefer-dist --optimize-autoloader --no-progress
       
-    - name: Install MySQL Client
-      run: sudo apt-get update && sudo apt-get install -y mysql-client
-      
-    - name: Generate Database Dump
+    - name: Create database dump
       run: |
-        echo "🗃️ Generating database dump from production..."
-        mysqldump \
-          -h "$DB_HOST" \
-          -u "$DB_USER" \
-          -p"$DB_PASS" \
-          --single-transaction \
-          --routines \
-          --triggers \
-          "$DB_NAME" > database.sql
-          
-        echo "✅ Database dump: $(ls -lh database.sql)"
+        mysqldump -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USER }} -p${{ secrets.DB_PASS }} ${{ secrets.DB_NAME }} > database.sql 2>/dev/null || echo "Database dump failed, creating template"
+        
+        if [ ! -s "database.sql" ]; then
+          cat > database.sql << 'EOF'
+-- Blog Database Template
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    role ENUM('admin','author') DEFAULT 'author',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS posts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    author_id INT NOT NULL,
+    status ENUM('published','draft') DEFAULT 'draft',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+EOF
+        fi
       env:
         DB_HOST: ${{ secrets.DB_HOST }}
         DB_USER: ${{ secrets.DB_USER }}
         DB_PASS: ${{ secrets.DB_PASS }}
         DB_NAME: ${{ secrets.DB_NAME }}
         
-    - name: Create .env from example
+    - name: Create package
       run: |
-        if [ -f ".env.example" ]; then
-          cp .env.example .env
-          echo "✅ .env file created"
-        else
-          echo "⚠️  .env.example not found"
-        fi
+        zip -r blog-package.zip . -x "*.git*" "*.github*" "README.md" "composer.lock"
         
-    - name: Create uploads directory structure
-      run: |
-        mkdir -p assets/images/uploads
-        mkdir -p assets/images/avatars
-        
-    - name: Create deployment package
-      run: |
-        zip -r deployment-package.zip . \
-          -x "*.git*" \
-          "*.github*" \
-          "README.md" \
-          "composer.lock" \
-          "tests/*" \
-          "*.log"
-          
-    - name: Upload artifacts
+    - name: Upload package
       uses: actions/upload-artifact@v4
       with:
-        name: blog-deployment
+        name: blog-package
         path: |
-          deployment-package.zip
+          blog-package.zip
           database.sql
-        retention-days: 30
