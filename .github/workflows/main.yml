@@ -1,39 +1,293 @@
-name: Simple Database Dump
+name: Build Blog Application
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+  release:
+    types: [ created ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Setup MySQL Client
-      run: sudo apt-get install -y mysql-client
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.0'
+        extensions: mbstring, ctype, filter, hash, iconv, pdo, pdo_mysql, gd
       
-    - name: Dump Entire Database
+    - name: Install dependencies
+      run: composer install --no-dev --prefer-dist --optimize-autoloader --no-progress
+      
+    - name: Install MySQL Client
+      run: sudo apt-get update && sudo apt-get install -y mysql-client
+      
+    - name: Analyze Blog Database Structure
       run: |
-        mysqldump \
-          -h "$DB_HOST" \
-          -u "$DB_USER" \
-          -p"$DB_PASS" \
-          --single-transaction \
-          --routines \
-          --triggers \
-          "$DB_NAME" > database_backup.sql
+        # Buat file PHP untuk analyze struktur blog database
+        cat > analyze_blog_db.php << 'EOF'
+<?php
+require_once 'vendor/autoload.php';
+
+use Dotenv\Dotenv;
+
+$dotenv = Dotenv::createImmutable(__DIR__);
+$dotenv->load();
+
+try {
+    $host = $_ENV['DB_HOST'] ?? 'localhost';
+    $dbname = $_ENV['DB_NAME'] ?? '';
+    $username = $_ENV['DB_USER'] ?? 'root';
+    $password = $_ENV['DB_PASS'] ?? '';
+    
+    $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $username, $password);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    
+    echo "🔍 Analyzing Blog Database Structure...\n\n";
+    
+    // Get all tables
+    $stmt = $pdo->query("SHOW TABLES");
+    $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
+    
+    echo "📊 Found " . count($tables) . " tables:\n";
+    
+    $tableInfo = [];
+    foreach ($tables as $table) {
+        echo "\n📋 Table: $table\n";
         
-        echo "Dump completed: $(ls -lh database_backup.sql)"
+        // Get table structure
+        $stmt = $pdo->query("DESCRIBE `$table`");
+        $columns = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        $columnNames = array_column($columns, 'Field');
+        echo "   Columns: " . implode(', ', $columnNames) . "\n";
+        
+        // Get row count
+        $stmt = $pdo->query("SELECT COUNT(*) as count FROM `$table`");
+        $count = $stmt->fetch(PDO::FETCH_ASSOC);
+        echo "   Records: " . $count['count'] . "\n";
+        
+        $tableInfo[$table] = [
+            'columns' => $columnNames,
+            'records' => $count['count']
+        ];
+    }
+    
+    // Simpan informasi untuk workflow
+    file_put_contents('database_info.json', json_encode($tableInfo, JSON_PRETTY_PRINT));
+    
+    // Generate expected tables untuk blog
+    $expectedTables = ['users', 'posts', 'categories', 'comments', 'settings'];
+    $missingTables = array_diff($expectedTables, $tables);
+    
+    if (!empty($missingTables)) {
+        echo "\n⚠️  Missing expected tables: " . implode(', ', $missingTables) . "\n";
+    }
+    
+} catch (PDOException $e) {
+    echo "❌ Database connection failed: " . $e->getMessage() . "\n";
+    file_put_contents('database_info.json', '{"error": "Connection failed"}');
+}
+EOF
+        
+        php analyze_blog_db.php
+        echo "=== Database Analysis Complete ==="
+        
+    - name: Generate Blog Database Dump
+      run: |
+        echo "🗃️ Generating blog database dump..."
+        
+        if [ -f "database_info.json" ] && ! grep -q "Connection failed" database_info.json; then
+          # Generate dump dengan struktur blog yang lengkap
+          mysqldump \
+            -h "${{ secrets.DB_HOST }}" \
+            -u "${{ secrets.DB_USER }}" \
+            -p"${{ secrets.DB_PASS }}" \
+            --single-transaction \
+            --routines \
+            --triggers \
+            --events \
+            --add-drop-table \
+            --complete-insert \
+            "${{ secrets.DB_NAME }}" > blog_database.sql
+          
+          echo "✅ Database dump created: $(ls -lh blog_database.sql)"
+          echo "📈 Tables exported: $(grep -c "CREATE TABLE" blog_database.sql || echo 0)"
+          
+        else
+          echo "❌ Using fallback - creating blog database template"
+          # Buat template SQL untuk blog
+          cat > blog_database.sql << 'EOF'
+-- BlogMe Database Structure
+-- Generated: $(date)
+
+SET FOREIGN_KEY_CHECKS=0;
+
+-- Users table for authors and admins
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    display_name VARCHAR(100),
+    role ENUM('admin', 'author', 'subscriber') DEFAULT 'subscriber',
+    avatar VARCHAR(255),
+    bio TEXT,
+    status ENUM('active', 'inactive') DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Categories table
+CREATE TABLE IF NOT EXISTS categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    description TEXT,
+    parent_id INT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (parent_id) REFERENCES categories(id) ON DELETE SET NULL
+);
+
+-- Posts table
+CREATE TABLE IF NOT EXISTS posts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) UNIQUE NOT NULL,
+    content LONGTEXT NOT NULL,
+    excerpt TEXT,
+    featured_image VARCHAR(255),
+    author_id INT NOT NULL,
+    category_id INT,
+    status ENUM('published', 'draft', 'pending') DEFAULT 'draft',
+    comment_status ENUM('open', 'closed') DEFAULT 'open',
+    view_count INT DEFAULT 0,
+    published_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+);
+
+-- Comments table
+CREATE TABLE IF NOT EXISTS comments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    post_id INT NOT NULL,
+    author_name VARCHAR(100) NOT NULL,
+    author_email VARCHAR(100) NOT NULL,
+    author_website VARCHAR(255),
+    content TEXT NOT NULL,
+    status ENUM('approved', 'pending', 'spam') DEFAULT 'pending',
+    parent_id INT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES comments(id) ON DELETE CASCADE
+);
+
+-- Settings table
+CREATE TABLE IF NOT EXISTS settings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    setting_key VARCHAR(100) UNIQUE NOT NULL,
+    setting_value TEXT,
+    setting_type ENUM('string', 'boolean', 'integer', 'json') DEFAULT 'string',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Insert default data
+INSERT IGNORE INTO users (username, email, password, display_name, role) VALUES 
+('admin', 'admin@blogme.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'Administrator', 'admin');
+
+INSERT IGNORE INTO categories (name, slug, description) VALUES 
+('Uncategorized', 'uncategorized', 'Default category'),
+('Technology', 'technology', 'Posts about technology'),
+('Lifestyle', 'lifestyle', 'Lifestyle and personal stories');
+
+INSERT IGNORE INTO settings (setting_key, setting_value, setting_type) VALUES 
+('site_name', 'BlogMe', 'string'),
+('site_description', 'A modern blog platform', 'string'),
+('posts_per_page', '12', 'integer'),
+('admin_email', 'admin@blogme.com', 'string'),
+('maintenance_mode', 'false', 'boolean');
+
+-- Create indexes for better performance
+CREATE INDEX idx_posts_status ON posts(status);
+CREATE INDEX idx_posts_published ON posts(published_at);
+CREATE INDEX idx_posts_author ON posts(author_id);
+CREATE INDEX idx_comments_post ON comments(post_id);
+CREATE INDEX idx_comments_status ON comments(status);
+
+SET FOREIGN_KEY_CHECKS=1;
+
+EOF
+          echo "✅ Blog template created"
+        fi
+        
       env:
         DB_HOST: ${{ secrets.DB_HOST }}
         DB_USER: ${{ secrets.DB_USER }}
         DB_PASS: ${{ secrets.DB_PASS }}
         DB_NAME: ${{ secrets.DB_NAME }}
         
-    - name: Upload Dump
-      uses: actions/upload-artifact@v4
-      with:
-        name: database-backup
-        path: database_backup.sql
+    - name: Create Uploads Directory Structure
+      run: |
+        # Buat struktur direktori uploads untuk blog
+        mkdir -p assets/images/uploads/2024/12
+        mkdir -p assets/images/avatars
+        mkdir -p assets/css
+        mkdir -p assets/js
+        
+        # Buat placeholder files jika diperlukan
+        echo "/* Blog assets will be here */" > assets/css/style.css
+        echo "// Blog scripts will be here" > assets/js/script.js
+        
+        # Buat .htaccess untuk protect uploads directory
+        cat > assets/images/uploads/.htaccess << 'EOF'
+Options -Indexes
+<Files ~ "\.(php|phtml)$">
+    Deny from all
+</Files>
+EOF
+        
+    - name: Create Deployment Package
+      run: |
+        # Buat package tanpa file development
+        zip -r blogme-package.zip . \
+          -x "*.git*" \
+          "*.github*" \
+          "README.md" \
+          "composer.lock" \
+          "analyze_blog_db.php" \
+          "database_info.json" \
+          "tests/*" \
+          "*.log" \
+          "*.sqlite"
+          
+        # Buat package database terpisah
+        zip blogme-database.zip blog_database.sql .env.example
+        
+    - name: Create Deployment Guide
+      run: |
+        cat > DEPLOYMENT_GUIDE.md << 'EOF'
+# BlogMe Deployment Guide
+
+## Files Included:
+- ✅ Complete PHP application
+- ✅ Vendor dependencies
+- ✅ Database SQL file
+- ✅ Asset directories
+- ✅ Configuration templates
+
+## Deployment Steps:
+
+### 1. Upload Files
+Extract `blogme-package.zip` to your web server.
+
+### 2. Database Setup
+```bash
+# Import database
+mysql -u your_username -p your_database < blog_database.sql
